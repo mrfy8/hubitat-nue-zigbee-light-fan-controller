@@ -1,13 +1,21 @@
 import groovy.transform.Field
+import groovy.json.JsonOutput
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * =======================================================================================
  * Nue Zigbee Light Fan Controller
- * Last modified: 2025-08-05
+ * Last modified: 2026-09-23
  * =======================================================================================
  */
 
 @Field static final List supportedFanSpeeds = ["low", "medium", "high", "off"]
+@Field static final List fanEndpoints = ["02", "03", "04"]
+@Field static final List allEndpoints = ["01", "02", "03", "04"]
+@Field static final Integer FAN_DEBOUNCE_MS = 250
+
+// Per-device fan endpoint state, keyed by device.id -> [endpoint: Boolean]
+@Field static ConcurrentHashMap<String, ConcurrentHashMap<String, Boolean>> fanStateCache = new ConcurrentHashMap<>()
 
 metadata {
     definition (name: "Nue Zigbee Light Fan Controller", namespace: "mr_fy_hubitat", author: "mr_fy") {
@@ -42,26 +50,27 @@ void installed() {
 
 void uninstalled() {
     log.info "uninstalled..."
+    fanStateCache.remove(device.id.toString())
 }
 
 void updated() {
     log.info "updated..."
     log.warn "debug logging is: ${enableDebug == true}"
     log.warn "description logging is: ${enableDesc == true}"
+    state.remove("fanSpeeds")
+    publishSupportedSpeeds()
+    // Repopulate in-memory endpoint cache from the device
+    sendHubCommand(new hubitat.device.HubMultiAction(refresh(), hubitat.device.Protocol.ZIGBEE))
 }
 
 void initialize() {
     log.info "initialize..."
     device.setName("NUE-FAN-LIGHT")
-
-    // Initialize fanSpeeds map if missing
-    if (state.fanSpeeds == null) {
-        state.fanSpeeds = ["02": false, "03": false, "04": false]
-    }
     updated()
-    configure()
+    // configure() returns commands; they must be sent explicitly when not called by the platform
+    sendHubCommand(new hubitat.device.HubMultiAction(configure(), hubitat.device.Protocol.ZIGBEE))
     unschedule()
-    if (enableDebug) runIn(1800,logsOff)
+    if (enableDebug) runIn(1800, "logsOff")
 }
 
 void parse(String description) {
@@ -70,80 +79,143 @@ void parse(String description) {
     def now = new Date().format("yyyy MMM dd EEE h:mm:ss a", location.timeZone)
     sendEvent(name: "lastCheckin", value: now)
 
-    def descMap = zigbee.parseDescriptionAsMap(description)
+    Map descMap = zigbee.parseDescriptionAsMap(description)
+    if (!descMap) return
 
-    // === Light events only for endpoint 01 ===
-    def lightEvent = zigbee.getEvent(description)
-    if (lightEvent && descMap?.endpoint == "01") {
-        lightEvent.name = "switch"
-        sendEvent(lightEvent)
-        if (enableDesc) log.info "${device.displayName} switch was set to ${lightEvent.value}"
-        sendChildEvent("${device.deviceNetworkId}-Light", "switch", lightEvent.value)
+    if (getClusterInt(descMap) != 0x0006) {
+        if (enableDebug) log.debug "ignoring non-OnOff message: ${descMap}"
         return
     }
 
-    // === Fan endpoint reporting (endpoints 02/03/04, attr 0x0000 in cluster 0x0006) ===
-    if (descMap?.clusterInt == 0x0006 && descMap.attrId == "0000") {
-        def ep = descMap.endpoint
-        def isOn = (descMap.value == "01")
+    String ep = normaliseEndpoint(descMap.endpoint ?: descMap.sourceEndpoint)
+    String value = null
 
-        if (["02","03","04"].contains(ep)) {
-            state.fanSpeeds[ep] = isOn
-
-            String newSpeed =
-                state.fanSpeeds["02"] ? "high" :
-                state.fanSpeeds["03"] ? "medium" :
-                state.fanSpeeds["04"] ? "low" :
-                "off"
-
-            if (device.currentValue("fan") != newSpeed) {
-                if (enableDesc) log.info "${device.displayName} fan was set to ${newSpeed}"
-                sendEvent(name:"fan", value:newSpeed)
-                sendChildEvent("${device.deviceNetworkId}-Fan","speed",newSpeed)
-            }
+    if (description.startsWith("read attr")) {
+        if (descMap.attrId == "0000") value = descMap.value
+    } else if (description.startsWith("catchall")) {
+        List data = descMap.data ?: []
+        if (descMap.command == "0A" && data.size() >= 4 && data[0] == "00" && data[1] == "00") {
+            // Report Attributes: attrId(2) type(1) value
+            value = data[3]
+        } else if (descMap.command == "01" && data.size() >= 5 && data[0] == "00" && data[1] == "00" && data[2] == "00") {
+            // Read Attributes Response: attrId(2) status(1) type(1) value
+            value = data[4]
         }
     }
+
+    if (value == null) {
+        if (enableDebug) log.debug "unhandled OnOff message on endpoint ${ep}: ${descMap}"
+        return
+    }
+
+    boolean isOn = (value == "01")
+
+    if (ep == "01") {
+        handleLightReport(isOn)
+    } else if (fanEndpoints.contains(ep)) {
+        handleFanReport(ep, isOn)
+    } else if (enableDebug) {
+        log.debug "OnOff report from unexpected endpoint ${ep}"
+    }
+}
+
+/* ======== report handlers ======== */
+
+private void handleLightReport(boolean isOn) {
+    String v = isOn ? "on" : "off"
+    if (enableDesc && device.currentValue("switch") != v) log.info "${device.displayName} switch was set to ${v}"
+    sendEvent(name: "switch", value: v)
+    sendChildEvent(lightDni(), "switch", v)
+}
+
+private void handleFanReport(String ep, boolean isOn) {
+    getFanCache().put(ep, isOn)
+    // Debounce: interlocked endpoints report in a burst; publish once after it settles
+    runInMillis(FAN_DEBOUNCE_MS, "publishFanSpeed")
+}
+
+// Scheduled handler - must not be private
+void publishFanSpeed() {
+    Map<String, Boolean> speeds = getFanCache()
+
+    String newSpeed =
+        speeds["02"] ? "high" :
+        speeds["03"] ? "medium" :
+        speeds["04"] ? "low" :
+        "off"
+
+    if (enableDebug) log.debug "publishFanSpeed() endpoints=${speeds} -> ${newSpeed}"
+    if (enableDesc && device.currentValue("speed") != newSpeed) log.info "${device.displayName} fan was set to ${newSpeed}"
+    sendEvent(name: "speed", value: newSpeed)
+    sendEvent(name: "fan", value: newSpeed)
+    sendChildEvent(fanDni(), "speed", newSpeed)
 }
 
 /* ======== capability commands ======== */
 
-def refresh() {
+List<String> refresh() {
     if (enableDebug) log.debug "refresh()"
-    def cmds = []
-    cmds << zigbee.onOffRefresh()
-    cmds << zigbee.readAttribute(0x0006, 0x0000, [destEndpoint: 0x01])
-    cmds << zigbee.readAttribute(0x0006, 0x0000, [destEndpoint: 0x02])
-    cmds << zigbee.readAttribute(0x0006, 0x0000, [destEndpoint: 0x03])
-    cmds << zigbee.readAttribute(0x0006, 0x0000, [destEndpoint: 0x04])
+    List<String> cmds = []
+    allEndpoints.each { ep ->
+        cmds += zigbee.readAttribute(0x0006, 0x0000, [destEndpoint: Integer.parseInt(ep, 16)], 200)
+    }
     return cmds
 }
 
-def List<hubitat.device.HubAction> configure() {
+List<String> configure() {
     if (enableDebug) log.debug "configure()"
-    getChildDevices().each {
-        deleteChildDevice("${it.deviceNetworkId}")
+    createChildrenIfMissing()
+
+    List<String> cmds = []
+    allEndpoints.each { ep ->
+        cmds << "zdo bind 0x${device.deviceNetworkId} 0x${ep} 0x01 0x0006 {${device.zigbeeId}} {}"
+        cmds << "delay 300"
     }
-    addChildType("Light", "Light")
-    addChildType("Fan", "Fan")
-
-    def cmds = []
-    cmds << new hubitat.device.HubAction("zdo bind 0x${device.deviceNetworkId} 0x01 0x01 0x0006 {${device.zigbeeId}} {}", hubitat.device.Protocol.ZIGBEE)
-    cmds << new hubitat.device.HubAction("zdo bind 0x${device.deviceNetworkId} 0x02 0x01 0x0006 {${device.zigbeeId}} {}", hubitat.device.Protocol.ZIGBEE)
-    cmds << new hubitat.device.HubAction("zdo bind 0x${device.deviceNetworkId} 0x03 0x01 0x0006 {${device.zigbeeId}} {}", hubitat.device.Protocol.ZIGBEE)
-    cmds << new hubitat.device.HubAction("zdo bind 0x${device.deviceNetworkId} 0x04 0x01 0x0006 {${device.zigbeeId}} {}", hubitat.device.Protocol.ZIGBEE)
-
-    cmds += zigbee.configureReporting(0x0006,0x0000,0x10,1,600,null,[destEndpoint:0x01])
-    cmds << "delay 200"
-    cmds += zigbee.configureReporting(0x0006,0x0000,0x10,1,600,null,[destEndpoint:0x02])
-    cmds << "delay 200"
-    cmds += zigbee.configureReporting(0x0006,0x0000,0x10,1,600,null,[destEndpoint:0x03])
-    cmds << "delay 200"
-    cmds += zigbee.configureReporting(0x0006,0x0000,0x10,1,600,null,[destEndpoint:0x04])
-
+    allEndpoints.each { ep ->
+        cmds += zigbee.configureReporting(0x0006, 0x0000, 0x10, 1, 600, null, [destEndpoint: Integer.parseInt(ep, 16)])
+        cmds << "delay 300"
+    }
+    cmds += refresh()
     return cmds
 }
 
 /* ======== custom commands and helpers ======== */
+
+private Map<String, Boolean> getFanCache() {
+    String id = device.id.toString()
+    ConcurrentHashMap<String, Boolean> m = fanStateCache.get(id)
+    if (m == null) {
+        fanStateCache.putIfAbsent(id, new ConcurrentHashMap<String, Boolean>())
+        m = fanStateCache.get(id)
+    }
+    return m
+}
+
+private void publishSupportedSpeeds() {
+    String json = JsonOutput.toJson(supportedFanSpeeds)
+    sendEvent(name: "supportedFanSpeeds", value: json)
+    sendChildEvent(fanDni(), "supportedFanSpeeds", json)
+}
+
+private Integer getClusterInt(Map descMap) {
+    if (descMap.clusterInt != null) return descMap.clusterInt as Integer
+    String c = descMap.clusterId ?: descMap.cluster
+    return c ? Integer.parseInt(c, 16) : null
+}
+
+private String normaliseEndpoint(def ep) {
+    if (ep == null) return null
+    String s = ep.toString().toUpperCase()
+    return s.length() == 1 ? "0${s}" : s
+}
+
+private String lightDni() { "${device.deviceNetworkId}-Light" }
+private String fanDni()   { "${device.deviceNetworkId}-Fan" }
+
+private void createChildrenIfMissing() {
+    if (!getChildDevice(lightDni())) addChildType("Light", "Light")
+    if (!getChildDevice(fanDni()))   addChildType("Fan", "Fan")
+}
 
 def addChildType(String label, String type) {
     def devLabel = device.label ?: device.name
@@ -167,34 +239,34 @@ def sendChildEvent(n,a,v){
 /* ======== Light and Fan control commands ======== */
 
 def lightOn(){
-    sendChildEvent("${device.deviceNetworkId}-Light","switch","on")
+    sendChildEvent(lightDni(),"switch","on")
     sendHubCommand(new hubitat.device.HubAction("he cmd 0x${device.deviceNetworkId} 0x01 0x0006 0x1 {}", hubitat.device.Protocol.ZIGBEE))
 }
 
 def lightOff(){
-    sendChildEvent("${device.deviceNetworkId}-Light","switch","off")
+    sendChildEvent(lightDni(),"switch","off")
     sendHubCommand(new hubitat.device.HubAction("he cmd 0x${device.deviceNetworkId} 0x01 0x0006 0x0 {}", hubitat.device.Protocol.ZIGBEE))
 }
 
 def fanOff(){
-    sendChildEvent("${device.deviceNetworkId}-Fan","speed","off")
-    ["02","03","04"].each{
+    sendChildEvent(fanDni(),"speed","off")
+    fanEndpoints.each{
         sendHubCommand(new hubitat.device.HubAction("he cmd 0x${device.deviceNetworkId} 0x${it} 0x0006 0x0 {}", hubitat.device.Protocol.ZIGBEE))
     }
 }
 
 def fanHighOn(){
-    sendChildEvent("${device.deviceNetworkId}-Fan","speed","high")
+    sendChildEvent(fanDni(),"speed","high")
     sendHubCommand(new hubitat.device.HubAction("he cmd 0x${device.deviceNetworkId} 0x02 0x0006 0x1 {}", hubitat.device.Protocol.ZIGBEE))
 }
 
 def fanMediumOn(){
-    sendChildEvent("${device.deviceNetworkId}-Fan","speed","medium")
+    sendChildEvent(fanDni(),"speed","medium")
     sendHubCommand(new hubitat.device.HubAction("he cmd 0x${device.deviceNetworkId} 0x03 0x0006 0x1 {}", hubitat.device.Protocol.ZIGBEE))
 }
 
 def fanLowOn(){
-    sendChildEvent("${device.deviceNetworkId}-Fan","speed","low")
+    sendChildEvent(fanDni(),"speed","low")
     sendHubCommand(new hubitat.device.HubAction("he cmd 0x${device.deviceNetworkId} 0x04 0x0006 0x1 {}", hubitat.device.Protocol.ZIGBEE))
 }
 
@@ -239,7 +311,7 @@ def componentCycleSpeed(cd){
 
 void componentOn(cd){
     if (enableDebug) log.debug "componentOn() called for child device: ${cd.displayName}"
-    if(cd.displayName.endsWith("-Light")) {
+    if(cd.deviceNetworkId == lightDni()) {
         lightOn()
     } else {
         setSpeed("medium")
@@ -247,7 +319,7 @@ void componentOn(cd){
 }
 
 void componentOff(cd){
-    if(cd.displayName.endsWith("-Light")) {
+    if(cd.deviceNetworkId == lightDni()) {
         lightOff()
     } else {
         fanOff()
@@ -264,4 +336,5 @@ void off(){
 
 void componentRefresh(cd){
     if (enableDebug) log.debug "componentRefresh ${cd.displayName}"
+    sendHubCommand(new hubitat.device.HubMultiAction(refresh(), hubitat.device.Protocol.ZIGBEE))
 }
